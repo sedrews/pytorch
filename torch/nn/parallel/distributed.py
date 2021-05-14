@@ -113,14 +113,49 @@ class _DDPUnevenInputsConfig(NamedTuple):
 # is completed.
 class _DDPSink(Function):
     @staticmethod
-    def forward(ctx, reducer, *inputs):
+    def forward(ctx, reducer, state_dict, *inputs):
         ctx.reducer = reducer
+        ctx.state_dict = state_dict
+        ctx.inputs = inputs
         return inputs
 
     @staticmethod
     def backward(ctx, *grad_outputs):
-        Variable._execution_engine.queue_callback(ctx.reducer._delay_all_reduce)
-        return (None, *grad_outputs)
+        state_dict = ctx.state_dict
+        static_graph_training = ctx.state_dict['static_graph']
+        if static_graph_training and ctx.state_dict['num_iterations'] == 1:
+            Variable._execution_engine.queue_callback(ctx.reducer._delay_all_reduce)
+            return (None, None, *grad_outputs)
+        # Check all state that indicates we need to find unused parameters.
+        find_unused = all([
+            state_dict['grad_enabled_in_fwd'],
+            state_dict['require_backward_grad_sync'],
+            state_dict['find_unused_parameters'],
+            (not static_graph_training)
+        ])
+        if find_unused:
+            # First type of unused params: parameters that did not participate
+            # in computing model outputs.
+            # Second type of unused params: params that won't get gradient
+            # because outputs they produced do not get used in computing loss
+            # for this call to backward.
+            used_inputs = []
+
+            outputs_unused_indices = []
+            for idx, inp in enumerate(ctx.inputs):
+                # Some inputs might not be tensors
+                if not isinstance(inp, torch.Tensor):
+                    continue
+
+                if grad_outputs[idx].sum() != torch.tensor(0, device=grad_outputs[idx].device):
+                    used_inputs.append(inp)
+                else:
+                    outputs_unused_indices.append(idx)
+
+            ctx.reducer.prepare_for_backward(used_inputs)
+            ctx.reducer.set_per_iteration_param_outputs_unused(outputs_unused_indices)
+
+        return (None, None, *grad_outputs)
 
 class DistributedDataParallel(Module):
     r"""Implements distributed data parallelism that is based on
@@ -800,33 +835,32 @@ class DistributedDataParallel(Module):
             else:
                 output = self.module(*inputs, **kwargs)
 
+            disable = False
             if torch.is_grad_enabled() and self.require_backward_grad_sync:
                 self.require_forward_param_sync = True
-                # We'll return the output object verbatim since it is a freeform
-                # object. We need to find any tensors in this object, though,
-                # because we need to figure out which parameters were used during
-                # this forward pass, to ensure we short circuit reduction for any
-                # unused parameters. Only if `find_unused_parameters` is set.
-                if self.find_unused_parameters and not self.static_graph:
-                    # Do not need to populate this for static graph.
-                    self.reducer.prepare_for_backward(list(_find_tensors(output)))
-                else:
-                    self.reducer.prepare_for_backward([])
+                if disable or not self.find_unused_parameters or self.static_graph:
+                    if self.find_unused_parameters:
+                        self.reducer.prepare_for_backward(list(_find_tensors(output)))
+                    else:
+                        self.reducer.prepare_for_backward([])
             else:
                 self.require_forward_param_sync = False
 
-        # TODO. Right now we add this sink for static_graph training only. once
-        # this feature is stable, we will add this sink for all cases. E.g.
-        # This sink can help capture more accuracte backward start time as well.
-        if self.static_graph and self.num_iterations == 1:
-            # Need to grab list of tensors from user output in order to pass
-            # to custom autograd function.
+        if not disable and (self.find_unused_parameters and not self.static_graph) or (self.static_graph and self.num_iterations == 1):
+            state_dict = {
+                'static_graph': self.static_graph,
+                'grad_enabled_in_fwd': torch.is_grad_enabled(),
+                'require_backward_grad_sync': self.require_backward_grad_sync,
+                'find_unused_parameters': self.find_unused_parameters,
+                'num_iterations': self.num_iterations,
+            }
             output_tensor_list, treespec = tree_flatten(output)
             passthrough_tensor_list = _DDPSink.apply(
                 self.reducer,
-                *output_tensor_list
+                state_dict,
+                *output_tensor_list,
             )
-            # Reconstruct output data structure.
+            # Reconstruct output data structure
             output = tree_unflatten(passthrough_tensor_list, treespec)
         return output
 
