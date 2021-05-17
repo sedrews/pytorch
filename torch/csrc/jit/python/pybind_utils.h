@@ -29,6 +29,7 @@
 #include <torch/csrc/distributed/rpc/py_rref.h>
 #include <torch/csrc/distributed/rpc/rref_impl.h>
 #endif
+#include <torch/library.h>
 
 #include <ATen/core/function_schema.h>
 #include <c10/core/Stream.h>
@@ -55,6 +56,13 @@
 
 namespace torch {
 namespace jit {
+
+// find the overloaded method for Torchbind using python arguments
+c10::optional<Method> match_overloaded_methods(
+    Module method_owner,
+    const std::string& method_name,
+    const struct tuple_slice& args,
+    const pybind11::kwargs& kwargs);
 
 void clear_registered_instances(void* ptr);
 

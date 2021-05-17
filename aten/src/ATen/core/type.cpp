@@ -1,11 +1,12 @@
 #include <ATen/core/Dict.h>
 #include <ATen/core/Tensor.h>
+#include <ATen/core/function.h>
 #include <ATen/core/function_schema.h>
+#include <ATen/core/grad_mode.h>
 #include <ATen/core/jit_type.h>
 #include <c10/macros/Macros.h>
+#include <c10/util/Optional.h>
 #include <c10/util/irange.h>
-#include <ATen/core/grad_mode.h>
-#include <ATen/core/function.h>
 #include <iostream>
 
 namespace c10 {
@@ -1086,6 +1087,28 @@ void ClassType::addMethod(torch::jit::Function* method) {
   methods_.push_back(method);
 }
 
+void ClassType::addOverloadedMethod(torch::jit::Function* method) {
+  // we can't use old findMethod because it searches based on the string name of
+  // function
+  for (auto added_method : methods_) {
+    if (method == added_method) {
+      return;
+    }
+  }
+
+  auto it = overloaded_methods_.insert(
+      std::pair<std::string, std::vector<std::string>>(
+          method->name(), std::vector<std::string>()));
+  // create a mangled name for this function and bookkeep
+  // the mangled name and its corresponding function.
+  const std::string& mangled_name =
+      method->name() + "__" + c10::guts::to_string(it.first->second.size());
+  it.first->second.push_back(mangled_name);
+  // registers where this overloaded function is stored in the methods map.
+  mangled_to_function_[mangled_name] = methods_.size();
+  methods_.push_back(method);
+}
+
 const std::vector<torch::jit::Function*>& ClassType::getForwardHooks() const {
     return forward_hooks_;
 }
@@ -1389,11 +1412,28 @@ void ClassType::checkForwardHookSchema(
 }
 
 torch::jit::Function* ClassType::findMethod(const std::string& name) const {
+  // if this is overloaded, there are multiple methods with the
+  // same name. Since this method is expected to work correctly
+  // only for normal methods, we just return nullptr
+  if (auto overloaded_methods = findOverloadedMethod(name)) {
+    if (overloaded_methods.value().size() == 1) {
+      return getMangledOverloadedMethod(overloaded_methods.value()[0]);
+    }
+    return nullptr;
+  }
+
+  // if the name is already mangled, we know there is only
+  // one corresponding function.
+  if (auto mangled_method = getMangledOverloadedMethod(name)) {
+    return mangled_method;
+  }
+
   for (auto method : methods_) {
     if (name == method->name()) {
       return method;
     }
   }
+
   return nullptr;
 }
 torch::jit::Function& ClassType::getMethod(const std::string& name) const {
@@ -1406,6 +1446,23 @@ torch::jit::Function& ClassType::getMethod(const std::string& name) const {
       repr_str(),
       "'");
   return *method;
+}
+
+c10::optional<std::vector<std::string>> ClassType::findOverloadedMethod(
+    const std::string& name) const {
+  if (overloaded_methods_.find(name) != overloaded_methods_.end()) {
+    return overloaded_methods_.find(name)->second;
+  }
+  return c10::nullopt;
+}
+
+torch::jit::Function* ClassType::getMangledOverloadedMethod(
+    const std::string& name) const {
+  if (mangled_to_function_.find(name) != mangled_to_function_.end()) {
+    auto actual_method_idx = mangled_to_function_.find(name)->second;
+    return methods_[actual_method_idx];
+  }
+  return nullptr;
 }
 
 torch::jit::Function* ClassType::findHook(const std::string& name) const {
